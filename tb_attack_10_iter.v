@@ -3,13 +3,13 @@
  *  Edit if you want to change behaviour (no SV needed; plain defines)
  *  ------------------------------------------------------------------*/
 `define STOP_WHEN_PERFECT   1   // 1 = break inner loop when correlation >= 0.95
-`define DUMP_EVERY_BYTE     1   // 0 = only dump final snapshot
-`define DUMP_EVERY_ITER     1   // 1 = dump after each iteration
+`define DUMP_EVERY_BYTE     0   // 0 = only dump final snapshot (changed for performance)
+`define DUMP_EVERY_ITER     0   // 0 = only dump final results (changed for performance)
 `define CORRELATION_THRESH  0.95 // 0.95 correlation threshold
-`define NUM_ITERATIONS      10  // Number of refinement iterations
+`define NUM_ITERATIONS      200  // Number of refinement iterations
 /*  =================================================================== */
 
-module tb_trngA_iterative;
+module tb_trng_attack_200_iter;
 
     /* ------------ DUT PARAMS (match RTL) ---------------------------- */
     parameter ADDR_WIDTH   = 14;   // 16 384 words → 128×128 image
@@ -63,8 +63,19 @@ module tb_trngA_iterative;
     );
 
     /* ------------ reference image (8-bit pixels) ------------------- */
-    reg [7:0] plain_pix [0:16383];
-    initial   $readmemh("image_data.txt", plain_pix);
+    reg [63:0] temp_pix [0:16383];   // Temporary for reading up to 44-bit hex values
+    reg [7:0] plain_pix [0:16383];   // Final 8-bit pixels
+    
+    initial begin
+        $readmemh("image_data.txt", temp_pix);
+        // Convert to 8-bit pixels (take LSB)
+        for (i = 0; i < 16384; i = i + 1) begin
+            plain_pix[i] = temp_pix[i][7:0];
+        end
+        $display("Loaded image data: %0d pixels", 16384);
+        $display("Sample pixels: %02X %02X %02X %02X %02X", 
+                 plain_pix[0], plain_pix[1], plain_pix[2], plain_pix[3], plain_pix[4]);
+    end
 
     /* ------------ secret & attacker keys --------------------------- */
     reg [63:0] true_trng_a;
@@ -79,23 +90,34 @@ module tb_trngA_iterative;
     /* ------------ correlation calculation storage ------------------ */
     reg [7:0] decoded_pix [0:16383];   // store decoded pixels for correlation
     
-    /* ------------ multi-iteration storage -------------------------- */
-    reg [63:0] iteration_keys [0:9];   // store key from each iteration (10 iterations)
-    real iteration_scores [0:9];       // store final score from each iteration (raw correlation)
+    /* ------------ multi-iteration storage (EXPANDED) --------------- */
+    reg [63:0] iteration_keys [0:199];   // store key from each iteration
+    reg signed [31:0] iteration_scores [0:199];  // store correlation * 1000000 as integer
     
     /* ------------ locals ------------------------------------------- */
     integer i, val, best_val, iter_idx;
-    real best_corr, cur_corr;  // Use real for correlation values
+    reg signed [31:0] best_corr_int, cur_corr_int;  // correlation * 1000000
+    real best_corr_real, cur_corr_real;             // for display only
     integer byte_idx, fh;
     reg [63:0] found_trng_a, cand;
     reg [255:0] fname;
+    
+    /* ------------ Progress tracking for long runs ------------------ */
+    integer progress_milestone;
+    real start_time, current_time;
 
     /* =================================================================
      *  MAIN FLOW
      * =================================================================*/
     initial begin
+        $display("Starting 200-iteration TRNG attack simulation...");
+        $display("Target key: %h", true_trng_a);
+        $display("Progress will be reported every 10 iterations.");
+        
+        start_time = $realtime;
+        
         #20 rst_n = 1;   // de-assert reset
-        #20;
+        #50;  // Allow more settle time
 
         encode_reference_image();   // write obfuscated SRAM
         decode_reference_image();   // save full correct decode
@@ -109,64 +131,106 @@ module tb_trngA_iterative;
         found_trng_a = 64'h0;  // Start with all zeros
 
         for (iter_idx = 0; iter_idx < NUM_ITERATIONS; iter_idx = iter_idx + 1) begin
-            $display("\n" + "="*40);
-            $display("ITERATION %0d (starting key: %h)", iter_idx, found_trng_a);
-            $display("="*40);
+            // Progress reporting every 10 iterations
+            if (iter_idx % 10 == 0) begin
+                current_time = $realtime;
+                $display("\n[PROGRESS] Iteration %0d/%0d (%.1f%%) - Time: %.2f ms", 
+                         iter_idx, NUM_ITERATIONS, 
+                         (iter_idx * 100.0) / NUM_ITERATIONS,
+                         (current_time - start_time) / 1000000.0);
+            end
+
+            // Detailed progress for first few iterations only
+            if (iter_idx < 3) begin
+                $display("\n" + "="*40);
+                $display("ITERATION %0d (starting key: %h)", iter_idx, found_trng_a);
+                $display("="*40);
+            end
 
             /* ---------- iterative brute-force per byte (MSB→LSB) ---- */
             for (byte_idx = 7; byte_idx >= 0; byte_idx = byte_idx - 1) begin
-                $display("\n--- Iteration %0d, Searching byte %0d ---", iter_idx, byte_idx);
-                best_corr = -1.0; 
+                if (iter_idx < 3) begin
+                    $display("\n--- Iteration %0d, Searching byte %0d ---", iter_idx, byte_idx);
+                end
+                
+                best_corr_int = -1000000;  // -1.0 * 1000000
                 best_val = get_current_byte(found_trng_a, byte_idx);  // Start with current value
 
                 for (val = 0; val < 256; val = val + 1) begin : SEARCH
                     cand = found_trng_a;
                     set_byte_value(cand, byte_idx, val);
-                    pearson_score_candidate(cand, cur_corr);
+                    pearson_score_candidate(cand, cur_corr_int);
 
-                    if (cur_corr > best_corr) begin
-                        best_corr = cur_corr;
-                        best_val  = val;
+                    if (cur_corr_int > best_corr_int) begin
+                        best_corr_int = cur_corr_int;
+                        best_val = val;
                     end
-                    if (STOP_WHEN_PERFECT && cur_corr >= 0.95)
-                        disable SEARCH;               // early exit
+                    
+                    // Early exit if correlation >= 0.95
+                    if (STOP_WHEN_PERFECT && cur_corr_int >= 950000)
+                        disable SEARCH;
                 end
 
                 set_byte_value(found_trng_a, byte_idx, best_val);
-                $display("iter%0d byte%0d chosen = 0x%02X  (correlation %0.6f)",
-                         iter_idx, byte_idx, best_val[7:0], best_corr);
+                best_corr_real = best_corr_int / 1000000.0;  // Convert back to real for display
+                
+                if (iter_idx < 3) begin
+                    $display("iter%0d byte%0d chosen = 0x%02X  (correlation %0.6f)",
+                             iter_idx, byte_idx, best_val[7:0], best_corr_real);
+                end
 
-                if (DUMP_EVERY_BYTE) dump_byte_snapshot(iter_idx, byte_idx);
+                if (DUMP_EVERY_BYTE && iter_idx < 5) begin
+                    dump_byte_snapshot(iter_idx, byte_idx);
+                end
             end
 
             // Store iteration results
             iteration_keys[iter_idx] = found_trng_a;
             pearson_score_candidate(found_trng_a, iteration_scores[iter_idx]);
             
-            $display("\nIteration %0d complete:", iter_idx);
-            $display("  Key: %h", found_trng_a);
-            $display("  Score: %0.6f", iteration_scores[iter_idx]);
+            if (iter_idx < 3) begin
+                $display("\nIteration %0d complete:", iter_idx);
+                $display("  Key: %h", found_trng_a);
+                $display("  Score: %0.6f", iteration_scores[iter_idx] / 1000000.0);
+            end
 
-            if (DUMP_EVERY_ITER) dump_iteration_snapshot(iter_idx);
+            if (DUMP_EVERY_ITER && iter_idx < 5) begin
+                dump_iteration_snapshot(iter_idx);
+            end
+            
+            // Check for early convergence
+            if (found_trng_a == true_trng_a) begin
+                $display("\n*** EXACT MATCH FOUND at iteration %0d! ***", iter_idx);
+                $display("Key: %h", found_trng_a);
+                $display("Score: %0.6f", iteration_scores[iter_idx] / 1000000.0);
+                // Continue running to see if it stays stable
+            end
+            
+            // Show high-scoring keys
+            if (iteration_scores[iter_idx] > 800000) begin  // > 0.8 correlation
+                $display("High score at iter %0d: %h (%.6f)", 
+                         iter_idx, found_trng_a, iteration_scores[iter_idx] / 1000000.0);
+            end
         end
 
         // Final summary
+        current_time = $realtime;
         $display("\n" + "="*60);
-        $display("MULTI-ITERATION ATTACK SUMMARY");
+        $display("MULTI-ITERATION ATTACK COMPLETED");
+        $display("Total time: %.2f ms", (current_time - start_time) / 1000000.0);
         $display("="*60);
-        $display("Ground-truth TRNG_A = %h", true_trng_a);
-        for (iter_idx = 0; iter_idx < NUM_ITERATIONS; iter_idx = iter_idx + 1) begin
-            $display("Iteration %0d result  = %h (score: %0.6f)", 
-                     iter_idx, iteration_keys[iter_idx], iteration_scores[iter_idx]);
-        end
-
+        
+        analyze_convergence();
         dump_final_comparison();
         generate_summary_file();
+        generate_convergence_analysis();
+        
+        $display("\nSimulation complete. Check output files for detailed results.");
         $finish;
     end
 
     /* =================================================================
-     *  HELPER FUNCTIONS for byte manipulation (Traditional Verilog)
+     *  HELPER FUNCTIONS for byte manipulation (Pure Verilog)
      * =================================================================*/
     function [7:0] get_current_byte;
         input [63:0] key;
@@ -210,12 +274,13 @@ module tb_trngA_iterative;
      * =================================================================*/
     task encode_reference_image;
         begin
+            $display("Encoding reference image with true keys...");
             trng_a_in = true_trng_a;
             trng_d_in = true_trng_d;
             dcr = 1; 
-            repeat (3) @(posedge clk); 
+            repeat (5) @(posedge clk); 
             dcr = 0; 
-            @(posedge clk);
+            repeat (5) @(posedge clk);
 
             for (i = 0; i < 16384; i = i + 1) begin
                 @(posedge clk);
@@ -226,23 +291,26 @@ module tb_trngA_iterative;
                 @(posedge clk);
                 cs = 0; 
                 we = 0;
+                @(posedge clk);
             end
-            repeat (5) @(posedge clk);
+            repeat (10) @(posedge clk);
+            $display("Reference image encoded successfully");
         end
     endtask
 
     /* =================================================================
      *  TASK: decode_reference_image
-     *        true decode ─ used by Python as correlation target
+     *        true decode ─ used as correlation target
      * =================================================================*/
     task decode_reference_image;
         begin
+            $display("Decoding reference image with true keys...");
             trng_a_in = true_trng_a;
             trng_d_in = true_trng_d;
             dcr = 1; 
-            repeat (3) @(posedge clk); 
+            repeat (5) @(posedge clk); 
             dcr = 0; 
-            @(posedge clk);
+            repeat (5) @(posedge clk);
 
             fh = $fopen("reference_correct_decode.txt","w");
             for (i = 0; i < 16384; i = i + 1) begin
@@ -252,9 +320,10 @@ module tb_trngA_iterative;
                 addr = i;
                 @(posedge clk);
                 while (!ready) @(posedge clk);
-                @(posedge clk);
+                repeat (2) @(posedge clk);
                 $fwrite(fh, "%013X\n", rdata);
                 cs = 0;
+                @(posedge clk);
             end
             $fclose(fh);
             $display("Generated: reference_correct_decode.txt");
@@ -267,12 +336,13 @@ module tb_trngA_iterative;
      * =================================================================*/
     task generate_comparison_case;
         begin
+            $display("Generating comparison case (correct TRNG_A, wrong TRNG_D)...");
             trng_a_in = true_trng_a;    // Use CORRECT address key
             trng_d_in = bad_trng_d;     // Use WRONG data key
             dcr = 1; 
-            repeat (3) @(posedge clk); 
+            repeat (5) @(posedge clk); 
             dcr = 0; 
-            @(posedge clk);
+            repeat (5) @(posedge clk);
 
             fh = $fopen("correct_trnga_wrong_trngd.txt","w");
             for (i = 0; i < 16384; i = i + 1) begin
@@ -282,9 +352,10 @@ module tb_trngA_iterative;
                 addr = i;
                 @(posedge clk);
                 while (!ready) @(posedge clk);
-                @(posedge clk);
+                repeat (2) @(posedge clk);
                 $fwrite(fh, "%013X\n", rdata);
                 cs = 0;
+                @(posedge clk);
             end
             $fclose(fh);
             $display("Generated: correct_trnga_wrong_trngd.txt");
@@ -293,29 +364,37 @@ module tb_trngA_iterative;
 
     /* =================================================================
      *  TASK: pearson_score_candidate
-     *        Calculate Pearson correlation coefficient between 
-     *        decoded pixels and original plaintext
-     *        Returns correlation * 1000 as signed integer
+     *        Calculate Pearson correlation coefficient 
+     *        Returns correlation * 1000000 as signed integer
      * =================================================================*/
     task pearson_score_candidate;
         input  [63:0] key;
-        output real correlation;
+        output reg signed [31:0] correlation_int;
         
-        // Correlation calculation variables
-        integer sum_x, sum_y, sum_xy, sum_x2, sum_y2;
-        integer n;
-        integer numerator, denom_x, denom_y;
-        real denom_real;
+        // Use 64-bit arithmetic to prevent overflow
+        reg signed [63:0] sum_x, sum_y, sum_xy, sum_x2, sum_y2;
+        reg signed [31:0] n;
+        reg signed [63:0] numerator, denom_x, denom_y;
+        real denom_real, correlation_real;
+        
+        // Debug variables
+        integer debug_same_count, debug_zero_count, debug_max_decoded, debug_min_decoded;
         
         begin
-            // First pass: read all decoded pixels
+            // Clear SRAM state and set new key
             trng_a_in = key;
             trng_d_in = bad_trng_d;
             dcr = 1; 
-            repeat (3) @(posedge clk); 
+            repeat (5) @(posedge clk); 
             dcr = 0; 
-            @(posedge clk);
+            repeat (5) @(posedge clk);
 
+            // Read all decoded pixels with proper timing
+            debug_same_count = 0;
+            debug_zero_count = 0;
+            debug_max_decoded = 0;
+            debug_min_decoded = 255;
+            
             for (i = 0; i < 16384; i = i + 1) begin
                 @(posedge clk);
                 cs = 1; 
@@ -323,12 +402,19 @@ module tb_trngA_iterative;
                 addr = i;
                 @(posedge clk);
                 while (!ready) @(posedge clk);
-                @(posedge clk);
+                repeat (2) @(posedge clk);  // Extra cycles for stability
                 decoded_pix[i] = rdata[7:0];  // Use LSB as decoded pixel
                 cs = 0;
+                @(posedge clk);
+                
+                // Debug statistics
+                if (decoded_pix[i] == plain_pix[i]) debug_same_count = debug_same_count + 1;
+                if (decoded_pix[i] == 0) debug_zero_count = debug_zero_count + 1;
+                if (decoded_pix[i] > debug_max_decoded) debug_max_decoded = decoded_pix[i];
+                if (decoded_pix[i] < debug_min_decoded) debug_min_decoded = decoded_pix[i];
             end
             
-            // Calculate Pearson correlation coefficient
+            // Calculate Pearson correlation coefficient using 64-bit arithmetic
             n = 16384;
             sum_x = 0; 
             sum_y = 0; 
@@ -336,7 +422,7 @@ module tb_trngA_iterative;
             sum_x2 = 0; 
             sum_y2 = 0;
             
-            // First pass: calculate sums
+            // Calculate sums
             for (i = 0; i < n; i = i + 1) begin
                 sum_x  = sum_x  + plain_pix[i];
                 sum_y  = sum_y  + decoded_pix[i];
@@ -345,22 +431,110 @@ module tb_trngA_iterative;
                 sum_y2 = sum_y2 + (decoded_pix[i] * decoded_pix[i]);
             end
             
-            // Calculate correlation
+            // Calculate correlation components
             numerator = (n * sum_xy) - (sum_x * sum_y);
             denom_x   = (n * sum_x2) - (sum_x * sum_x);
             denom_y   = (n * sum_y2) - (sum_y * sum_y);
             
+            // Debug output for first iteration only
+            if (iter_idx == 0 && byte_idx == 7 && val < 5) begin
+                $display("DEBUG[key=%h]: same=%0d, zero=%0d, min=%0d, max=%0d", 
+                         key, debug_same_count, debug_zero_count, debug_min_decoded, debug_max_decoded);
+                $display("DEBUG: Plain[0:4]=%02X,%02X,%02X,%02X,%02X", 
+                         plain_pix[0], plain_pix[1], plain_pix[2], plain_pix[3], plain_pix[4]);
+                $display("DEBUG: Decoded[0:4]=%02X,%02X,%02X,%02X,%02X", 
+                         decoded_pix[0], decoded_pix[1], decoded_pix[2], decoded_pix[3], decoded_pix[4]);
+                $display("DEBUG: sum_x=%0d, sum_y=%0d, sum_xy=%0d", sum_x, sum_y, sum_xy);
+                $display("DEBUG: denom_x=%0d, denom_y=%0d, numerator=%0d", denom_x, denom_y, numerator);
+                
+                // Show SRAM raw data for first few addresses
+                $display("DEBUG: Raw SRAM data[0:4]=%h,%h,%h,%h,%h", 
+                         rdata, rdata, rdata, rdata, rdata);
+            end
+            
             // Handle edge cases
             if (denom_x <= 0 || denom_y <= 0) begin
-                correlation = -1.0;  // Invalid correlation
+                correlation_int = -1000000;  // -1.0 * 1000000
+                if (iter_idx == 0 && byte_idx == 7 && val < 5) begin
+                    $display("DEBUG: Invalid correlation - negative variance");
+                end
             end else begin
-                // Calculate denominator using real arithmetic
+                // Calculate using real arithmetic for accuracy
                 denom_real = $sqrt($itor(denom_x) * $itor(denom_y));
-                correlation = $itor(numerator) / denom_real;
+                correlation_real = $itor(numerator) / denom_real;
                 
                 // Clamp to valid range [-1.0, 1.0]
-                if (correlation > 1.0) correlation = 1.0;
-                if (correlation < -1.0) correlation = -1.0;
+                if (correlation_real > 1.0) correlation_real = 1.0;
+                if (correlation_real < -1.0) correlation_real = -1.0;
+                
+                // Convert to integer (* 1000000)
+                correlation_int = $rtoi(correlation_real * 1000000.0);
+                
+                if (iter_idx == 0 && byte_idx == 7 && val < 5) begin
+                    $display("DEBUG: Valid correlation = %.6f", correlation_real);
+                end
+            end
+        end
+    endtask
+
+    /* =================================================================
+     *  CONVERGENCE ANALYSIS
+     * =================================================================*/
+    task analyze_convergence;
+        integer exact_matches, first_match_iter;
+        reg signed [31:0] max_score;
+        integer max_score_iter;
+        integer stable_iterations;
+        
+        begin
+            exact_matches = 0;
+            first_match_iter = -1;
+            max_score = -1000000;
+            max_score_iter = -1;
+            stable_iterations = 0;
+            
+            // Find statistics
+            for (i = 0; i < NUM_ITERATIONS; i = i + 1) begin
+                if (iteration_keys[i] == true_trng_a) begin
+                    exact_matches = exact_matches + 1;
+                    if (first_match_iter == -1) first_match_iter = i;
+                end
+                
+                if (iteration_scores[i] > max_score) begin
+                    max_score = iteration_scores[i];
+                    max_score_iter = i;
+                end
+                
+                // Check stability (key unchanged from previous iteration)
+                if (i > 0 && iteration_keys[i] == iteration_keys[i-1]) begin
+                    stable_iterations = stable_iterations + 1;
+                end
+            end
+            
+            $display("\nCONVERGENCE ANALYSIS:");
+            $display("Ground-truth TRNG_A = %h", true_trng_a);
+            $display("Exact matches: %0d/%0d iterations (%.1f%%)", 
+                     exact_matches, NUM_ITERATIONS, 
+                     (exact_matches * 100.0) / NUM_ITERATIONS);
+            
+            if (first_match_iter >= 0) begin
+                $display("First exact match: iteration %0d", first_match_iter);
+            end else begin
+                $display("No exact matches found");
+            end
+            
+            $display("Maximum score: %.6f at iteration %0d", max_score / 1000000.0, max_score_iter);
+            $display("Best key: %h", iteration_keys[max_score_iter]);
+            $display("Stable iterations: %0d/%0d (%.1f%%)", 
+                     stable_iterations, NUM_ITERATIONS-1,
+                     (stable_iterations * 100.0) / (NUM_ITERATIONS-1));
+            
+            // Show final 10 iterations
+            $display("\nFinal 10 iterations:");
+            for (i = NUM_ITERATIONS-10; i < NUM_ITERATIONS; i = i + 1) begin
+                $display("  Iter %3d: %h (score: %.6f) %s", 
+                         i, iteration_keys[i], iteration_scores[i] / 1000000.0,
+                         (iteration_keys[i] == true_trng_a) ? "EXACT" : "");
             end
         end
     endtask
@@ -375,9 +549,9 @@ module tb_trngA_iterative;
             trng_a_in = found_trng_a;
             trng_d_in = bad_trng_d;
             dcr = 1; 
-            repeat (3) @(posedge clk); 
+            repeat (5) @(posedge clk); 
             dcr = 0; 
-            @(posedge clk);
+            repeat (5) @(posedge clk);
 
             $sformat(fname, "iter%0d_byte%0d.txt", iter_idx, byte_idx);
             fh = $fopen(fname,"w");
@@ -389,12 +563,13 @@ module tb_trngA_iterative;
                 addr = i;
                 @(posedge clk);
                 while (!ready) @(posedge clk);
-                @(posedge clk);
+                repeat (2) @(posedge clk);
                 if (rdata === {DATA_WIDTH{1'bx}})
                     $fwrite(fh,"XXXXXXXXXXXXXXX\n");
                 else
                     $fwrite(fh,"%013X\n", rdata);
                 cs = 0;
+                @(posedge clk);
             end
             $fclose(fh);
         end
@@ -406,9 +581,9 @@ module tb_trngA_iterative;
             trng_a_in = found_trng_a;
             trng_d_in = bad_trng_d;
             dcr = 1; 
-            repeat (3) @(posedge clk); 
+            repeat (5) @(posedge clk); 
             dcr = 0; 
-            @(posedge clk);
+            repeat (5) @(posedge clk);
 
             $sformat(fname, "iteration_%0d_final.txt", iter_idx);
             fh = $fopen(fname,"w");
@@ -420,12 +595,13 @@ module tb_trngA_iterative;
                 addr = i;
                 @(posedge clk);
                 while (!ready) @(posedge clk);
-                @(posedge clk);
+                repeat (2) @(posedge clk);
                 if (rdata === {DATA_WIDTH{1'bx}})
                     $fwrite(fh,"XXXXXXXXXXXXXXX\n");
                 else
                     $fwrite(fh,"%013X\n", rdata);
                 cs = 0;
+                @(posedge clk);
             end
             $fclose(fh);
             $display("   ↳ dumped %s", fname);
@@ -433,15 +609,27 @@ module tb_trngA_iterative;
     endtask
 
     task dump_final_comparison;
+        integer sample_iterations[0:19]; // Sample every 10th iteration
+        integer sample_idx;
         begin
-            // Dump each iteration's final result for Python analysis
-            for (iter_idx = 0; iter_idx < NUM_ITERATIONS; iter_idx = iter_idx + 1) begin
+            // Sample iterations: 0, 10, 20, ..., 190, 199
+            for (i = 0; i < 19; i = i + 1) begin
+                sample_iterations[i] = i * 10;
+            end
+            sample_iterations[19] = 199; // Include final iteration
+            
+            $display("Dumping sample iterations for analysis...");
+            
+            // Dump sampled iterations
+            for (sample_idx = 0; sample_idx < 20; sample_idx = sample_idx + 1) begin
+                iter_idx = sample_iterations[sample_idx];
+                
                 trng_a_in = iteration_keys[iter_idx];
                 trng_d_in = bad_trng_d;
                 dcr = 1; 
-                repeat (3) @(posedge clk); 
+                repeat (5) @(posedge clk); 
                 dcr = 0; 
-                @(posedge clk);
+                repeat (5) @(posedge clk);
 
                 $sformat(fname, "final_iteration_%0d.txt", iter_idx);
                 fh = $fopen(fname,"w");
@@ -453,35 +641,66 @@ module tb_trngA_iterative;
                     addr = i;
                     @(posedge clk);
                     while (!ready) @(posedge clk);
-                    @(posedge clk);
+                    repeat (2) @(posedge clk);
                     if (rdata === {DATA_WIDTH{1'bx}})
                         $fwrite(fh,"XXXXXXXXXXXXXXX\n");
                     else
                         $fwrite(fh,"%013X\n", rdata);
                     cs = 0;
+                    @(posedge clk);
                 end
                 $fclose(fh);
             end
-            $display("Generated final iteration files for Python analysis");
+            $display("Generated sample iteration files for analysis");
         end
     endtask
 
     task generate_summary_file;
         begin
             fh = $fopen("attack_summary.txt","w");
-            $fwrite(fh,"Multi-Iteration Attack Summary\n");
-            $fwrite(fh,"==============================\n\n");
+            $fwrite(fh,"Multi-Iteration Attack Summary (200 iterations)\n");
+            $fwrite(fh,"===============================================\n\n");
             $fwrite(fh,"Ground Truth TRNG_A: %h\n", true_trng_a);
             $fwrite(fh,"Number of iterations: %0d\n\n", NUM_ITERATIONS);
             
-            for (iter_idx = 0; iter_idx < NUM_ITERATIONS; iter_idx = iter_idx + 1) begin
+            // Write every 10th iteration + final few
+            for (iter_idx = 0; iter_idx < NUM_ITERATIONS; iter_idx = iter_idx + 10) begin
                 $fwrite(fh,"Iteration %0d:\n", iter_idx);
                 $fwrite(fh,"  Key:   %h\n", iteration_keys[iter_idx]);
-                $fwrite(fh,"  Score: %0.6f\n", iteration_scores[iter_idx]);
+                $fwrite(fh,"  Score: %0.6f\n", iteration_scores[iter_idx] / 1000000.0);
                 $fwrite(fh,"  Match: %s\n\n", (iteration_keys[iter_idx] == true_trng_a) ? "EXACT" : "PARTIAL");
             end
+            
+            // Final iteration if not already included
+            if ((NUM_ITERATIONS - 1) % 10 != 0) begin
+                iter_idx = NUM_ITERATIONS - 1;
+                $fwrite(fh,"Iteration %0d (FINAL):\n", iter_idx);
+                $fwrite(fh,"  Key:   %h\n", iteration_keys[iter_idx]);
+                $fwrite(fh,"  Score: %0.6f\n", iteration_scores[iter_idx] / 1000000.0);
+                $fwrite(fh,"  Match: %s\n\n", (iteration_keys[iter_idx] == true_trng_a) ? "EXACT" : "PARTIAL");
+            end
+            
             $fclose(fh);
             $display("Generated: attack_summary.txt");
+        end
+    endtask
+
+    task generate_convergence_analysis;
+        begin
+            fh = $fopen("convergence_analysis.txt","w");
+            $fwrite(fh,"Convergence Analysis - 200 Iterations\n");
+            $fwrite(fh,"====================================\n\n");
+            
+            // Write all iteration results for detailed analysis
+            $fwrite(fh,"Iteration,Key,Score,Exact_Match\n");
+            for (iter_idx = 0; iter_idx < NUM_ITERATIONS; iter_idx = iter_idx + 1) begin
+                $fwrite(fh,"%0d,%h,%0.6f,%s\n", 
+                        iter_idx, iteration_keys[iter_idx], iteration_scores[iter_idx] / 1000000.0,
+                        (iteration_keys[iter_idx] == true_trng_a) ? "YES" : "NO");
+            end
+            
+            $fclose(fh);
+            $display("Generated: convergence_analysis.txt");
         end
     endtask
 

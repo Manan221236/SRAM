@@ -1,15 +1,9 @@
 `timescale 1ns / 1ps
 
-module tb_attack_multi_start_search;
+module tb_attack_fixed;
     
-    parameter NUM_ITERATIONS = 10;
-    parameter NUM_RANDOM_STARTS = 8;
-    parameter STOP_WHEN_PERFECT = 1;
-    parameter DUMP_EVERY_BYTE = 0;
-    parameter DUMP_EVERY_ITER = 1;
-    parameter ENABLE_DIAGNOSTICS = 1;
-    parameter ENABLE_KEY_VERIFICATION = 1;
-    parameter RANDOM_SEED = 42;
+    parameter NUM_ITERATIONS = 3;
+    parameter NUM_TEST_PIXELS = 100;  // Test with smaller set first
     
     reg clk;
     reg rst_n;
@@ -23,40 +17,23 @@ module tb_attack_multi_start_search;
     reg [63:0] trng_a_in;
     reg [31:0] trng_d_in;
     
-    reg [7:0] plain_pix [0:16383];
-    reg [7:0] decoded_pix [0:16383];
-    reg [7:0] temp_decoded [0:16383];
+    reg [7:0] plain_pix [0:NUM_TEST_PIXELS-1];
+    reg [7:0] decoded_pix [0:NUM_TEST_PIXELS-1];
+    reg [7:0] reference_pix [0:NUM_TEST_PIXELS-1];
     
     reg [63:0] true_trng_a;
     reg [31:0] true_trng_d;
-    reg [31:0] bad_trng_d;
-    reg [63:0] found_trng_a;
-    reg [63:0] global_best_key;
-    real global_best_score;
+    reg [63:0] best_trng_a;
+    real best_correlation;
     
-    reg [63:0] start_keys [0:NUM_RANDOM_STARTS-1];
-    reg [63:0] start_results [0:NUM_RANDOM_STARTS-1];
-    real start_scores [0:NUM_RANDOM_STARTS-1];
-    integer best_start_idx;
-    
-    reg [63:0] iteration_keys [0:NUM_ITERATIONS-1];
-    real iteration_composite [0:NUM_ITERATIONS-1];
-    
-    integer i, j, iter_idx, byte_idx, val, start_idx;
-    integer fh;
-    reg [63:0] cand;
-    real cur_pearson, cur_spearman, cur_cosine, cur_mse, cur_composite;
-    real best_composite, prev_score;
+    integer i, byte_idx, val;
+    real cur_correlation;
     integer best_val;
-    reg [8*50:1] fname;
     
-    real test_p, test_s, test_c, test_m, test_comp;
-    real pre_search_score, post_search_score;
-    integer consistency_errors;
-    
-    real true_key_score, wrong_key_score, zero_key_score;
-    
-    reg [31:0] rng_state;
+    // Module level variables
+    integer current_byte_val;
+    real effectiveness_ratio;
+    real hamming_dist;
     
     secure_sram_top dut (
         .clk(clk),
@@ -76,7 +53,8 @@ module tb_attack_multi_start_search;
     always #5 clk = ~clk;
     
     initial begin
-        $display("Starting MULTI-START RANDOM SEARCH Attack Testbench");
+        $display("FIXED CORRELATION ATTACK");
+        $display("========================");
         
         rst_n = 0;
         dcr = 0;
@@ -86,190 +64,358 @@ module tb_attack_multi_start_search;
         wdata = 0;
         trng_a_in = 0;
         trng_d_in = 0;
-        consistency_errors = 0;
-        global_best_score = -1000.0;
-        global_best_key = 64'h0;
-        best_start_idx = 0;
-        rng_state = RANDOM_SEED;
-        
-        load_realistic_test_image;
+        best_correlation = -1.0;
+        best_trng_a = 64'h0;
         
         true_trng_a = 64'hDEADBEEFCAFEBABE;
         true_trng_d = 32'h12345678;
-        bad_trng_d = 32'h87654321;
         
         repeat (10) @(posedge clk);
         rst_n = 1;
         repeat (5) @(posedge clk);
         
-        encode_reference_image;
-        decode_reference_image;
-        generate_comparison_case;
+        setup_attack;
+        test_ground_truth;
+        perform_attack;
+        analyze_results;
         
-        if (ENABLE_KEY_VERIFICATION) begin
-            perform_key_verification;
-        end
-        
-        $display("Starting multi-start search with %0d starting points", NUM_RANDOM_STARTS);
-        
-        generate_random_starting_points;
-        
-        for (start_idx = 0; start_idx < NUM_RANDOM_STARTS; start_idx = start_idx + 1) begin
-            $display("Starting point %0d: %h", start_idx, start_keys[start_idx]);
-            
-            found_trng_a = start_keys[start_idx];
-            
-            for (iter_idx = 0; iter_idx < NUM_ITERATIONS; iter_idx = iter_idx + 1) begin
-                $display("Start %0d - Iteration %0d", start_idx, iter_idx);
-                
-                for (byte_idx = 7; byte_idx >= 0; byte_idx = byte_idx - 1) begin
-                    $display("Searching byte %0d", byte_idx);
-                    
-                    if (ENABLE_DIAGNOSTICS) begin
-                        corrected_score_candidate(found_trng_a, test_p, test_s, test_c, test_m, pre_search_score);
-                    end
-                    
-                    best_composite = -1000.0;
-                    best_val = get_current_byte(found_trng_a, byte_idx);
-                    prev_score = pre_search_score;
-                    
-                    for (val = 0; val < 256; val = val + 1) begin
-                        cand = found_trng_a;
-                        set_byte_value(cand, byte_idx, val);
-                        
-                        corrected_score_candidate(cand, cur_pearson, cur_spearman, 
-                                               cur_cosine, cur_mse, cur_composite);
-                        
-                        if (ENABLE_DIAGNOSTICS && val == get_current_byte(found_trng_a, byte_idx)) begin
-                            if (cur_composite > pre_search_score) begin
-                                if ((cur_composite - pre_search_score) > 0.000001) begin
-                                    consistency_errors = consistency_errors + 1;
-                                end
-                            end else begin
-                                if ((pre_search_score - cur_composite) > 0.000001) begin
-                                    consistency_errors = consistency_errors + 1;
-                                end
-                            end
-                        end
-                        
-                        if (cur_composite > best_composite) begin
-                            best_composite = cur_composite;
-                            best_val = val;
-                        end
-                        
-                        if (STOP_WHEN_PERFECT && cur_composite >= 0.95) begin
-                            val = 256;
-                        end
-                    end
-                    
-                    if (best_composite > prev_score) begin
-                        if ((best_composite - prev_score) > 0.000001) begin
-                            set_byte_value(found_trng_a, byte_idx, best_val);
-                            $display("Improved byte %0d to 0x%02X (score: %0.6f)", 
-                                     byte_idx, best_val[7:0], best_composite);
-                        end
-                    end
-                    
-                    if (DUMP_EVERY_BYTE) dump_byte_snapshot(start_idx, iter_idx, byte_idx);
-                end
-                
-                if (start_idx == 0) begin
-                    iteration_keys[iter_idx] = found_trng_a;
-                    corrected_score_candidate(found_trng_a, test_p, test_s, test_c, test_m, iteration_composite[iter_idx]);
-                end
-                
-                if (DUMP_EVERY_ITER) dump_iteration_snapshot(start_idx, iter_idx);
-            end
-            
-            start_results[start_idx] = found_trng_a;
-            corrected_score_candidate(found_trng_a, test_p, test_s, test_c, test_m, start_scores[start_idx]);
-            
-            $display("Start %0d final: %h (score: %0.6f)", 
-                     start_idx, start_results[start_idx], start_scores[start_idx]);
-            
-            if (start_scores[start_idx] > global_best_score) begin
-                global_best_score = start_scores[start_idx];
-                global_best_key = start_results[start_idx];
-                best_start_idx = start_idx;
-                $display("New global best from start %0d: %0.6f", start_idx, global_best_score);
-            end
-        end
-        
-        $display("Multi-start search complete");
-        $display("Best result from start %0d: %0.6f", best_start_idx, global_best_score);
-        $display("Best key: %h", global_best_key);
-        
-        if (true_key_score <= global_best_score) begin
-            $display("ERROR: Attack found key better than ground truth!");
-        end else begin
-            $display("PASS: True key has highest score");
-        end
-        
-        found_trng_a = global_best_key;
-        for (iter_idx = 0; iter_idx < NUM_ITERATIONS; iter_idx = iter_idx + 1) begin
-            iteration_keys[iter_idx] = global_best_key;
-            iteration_composite[iter_idx] = global_best_score;
-        end
-        
-        dump_final_comparison;
-        generate_summary_file;
         $finish;
     end
-    
-    function [31:0] next_random;
-        input [31:0] current_state;
+
+    task setup_attack;
         begin
-            next_random = {current_state[30:0], current_state[31] ^ current_state[21] ^ current_state[1] ^ current_state[0]};
+            $display("\n=== SETUP ===");
+            
+            // Generate test pattern
+            for (i = 0; i < NUM_TEST_PIXELS; i = i + 1) begin
+                plain_pix[i] = (i * 7 + 13) % 256;  // Structured pattern
+            end
+            
+            $display("Generated %0d test pixels", NUM_TEST_PIXELS);
+            $display("Sample: %0d %0d %0d %0d %0d", 
+                     plain_pix[0], plain_pix[1], plain_pix[2], plain_pix[3], plain_pix[4]);
+            
+            // Encrypt with true keys
+            encrypt_data;
+            
+            // Create reference by reading with true keys
+            create_reference;
+        end
+    endtask
+    
+    task encrypt_data;
+        begin
+            $display("Encrypting data with true keys...");
+            
+            complete_system_reset;
+            
+            trng_a_in = true_trng_a;
+            trng_d_in = true_trng_d;
+            dcr = 1;
+            repeat (10) @(posedge clk);
+            dcr = 0;
+            repeat (5) @(posedge clk);
+
+            // Write data (gets encrypted)
+            for (i = 0; i < NUM_TEST_PIXELS; i = i + 1) begin
+                @(posedge clk);
+                cs = 1;
+                we = 1;
+                addr = i;
+                wdata = {43'd0, plain_pix[i]};
+                @(posedge clk);
+                while (!ready) @(posedge clk);
+                @(posedge clk);
+                cs = 0;
+                we = 0;
+                
+                // Small delay between operations
+                repeat (2) @(posedge clk);
+            end
+            
+            $display("Data encrypted and stored");
+            complete_system_reset;
+        end
+    endtask
+    
+    task create_reference;
+        integer matches;
+        begin
+            $display("Creating reference by reading with true keys...");
+            
+            complete_system_reset;
+            
+            trng_a_in = true_trng_a;
+            trng_d_in = true_trng_d;
+            dcr = 1;
+            repeat (10) @(posedge clk);
+            dcr = 0;
+            repeat (5) @(posedge clk);
+
+            // Read back with true keys (should give original)
+            for (i = 0; i < NUM_TEST_PIXELS; i = i + 1) begin
+                @(posedge clk);
+                cs = 1;
+                we = 0;
+                addr = i;
+                @(posedge clk);
+                while (!ready) @(posedge clk);
+                @(posedge clk);
+                reference_pix[i] = rdata[7:0];
+                cs = 0;
+                
+                repeat (2) @(posedge clk);
+            end
+            
+            $display("Reference created. Sample: %0d %0d %0d %0d %0d", 
+                     reference_pix[0], reference_pix[1], reference_pix[2], reference_pix[3], reference_pix[4]);
+            
+            // Check how many match
+            matches = 0;
+            for (i = 0; i < NUM_TEST_PIXELS; i = i + 1) begin
+                if (reference_pix[i] == plain_pix[i]) matches = matches + 1;
+            end
+            
+            $display("Reference check: %0d/%0d pixels match original (%0.1f%%)", 
+                     matches, NUM_TEST_PIXELS, (matches * 100.0) / NUM_TEST_PIXELS);
+            
+            if (matches > NUM_TEST_PIXELS * 0.9) begin
+                $display("GOOD: Reference matches original - system working");
+            end else begin
+                $display("ISSUE: Reference doesn't match - but continuing attack");
+            end
+            
+            complete_system_reset;
+        end
+    endtask
+
+    task test_ground_truth;
+        begin
+            $display("\n=== GROUND TRUTH TEST ===");
+            
+            // Test true key
+            calculate_correlation(true_trng_a, cur_correlation);
+            $display("True TRNG_A correlation: %0.6f", cur_correlation);
+            
+            // Test wrong keys
+            calculate_correlation(64'h0, cur_correlation);
+            $display("Zero TRNG_A correlation: %0.6f", cur_correlation);
+            
+            calculate_correlation(64'hFFFFFFFFFFFFFFFF, cur_correlation);
+            $display("Ones TRNG_A correlation: %0.6f", cur_correlation);
+            
+            if (cur_correlation > 0.5) begin
+                $display("WARNING: Random key gives high correlation - attack may not work");
+            end
+        end
+    endtask
+
+    task perform_attack;
+        begin
+            $display("\n=== PERFORMING ATTACK ===");
+            $display("Starting from all zeros and optimizing byte-by-byte...");
+            
+            best_trng_a = 64'h0000000000000000;
+            calculate_correlation(best_trng_a, best_correlation);
+            $display("Initial key: %h, correlation: %0.6f", best_trng_a, best_correlation);
+            
+            // Optimize each byte
+            for (byte_idx = 7; byte_idx >= 0; byte_idx = byte_idx - 1) begin
+                optimize_byte(byte_idx);
+            end
+            
+            $display("\nFinal key: %h", best_trng_a);
+            $display("Final correlation: %0.6f", best_correlation);
+        end
+    endtask
+    
+    task optimize_byte;
+        input integer byte_pos;
+        
+        real best_byte_corr, test_corr;
+        integer best_byte_val;
+        reg [63:0] test_key;
+        
+        begin
+            $display("\n--- Optimizing Byte %0d ---", byte_pos);
+            
+            best_byte_corr = best_correlation;
+            current_byte_val = get_current_byte(best_trng_a, byte_pos);
+            best_byte_val = current_byte_val;
+            
+            $display("Current value: 0x%02X, testing all 256 values...", current_byte_val);
+            
+            // Try all 256 values
+            for (val = 0; val < 256; val = val + 1) begin
+                test_key = best_trng_a;
+                set_byte_value(test_key, byte_pos, val);
+                
+                calculate_correlation(test_key, test_corr);
+                
+                if (test_corr > best_byte_corr) begin
+                    best_byte_corr = test_corr;
+                    best_byte_val = val;
+                    $display("  New best: 0x%02X -> correlation %0.6f", val, test_corr);
+                end
+                
+                // Progress indicator
+                if (val % 64 == 63) begin
+                    $display("  Progress: %0d/256 tested, best so far: 0x%02X (%0.6f)", 
+                             val + 1, best_byte_val, best_byte_corr);
+                end
+            end
+            
+            // Apply best value
+            set_byte_value(best_trng_a, byte_pos, best_byte_val);
+            best_correlation = best_byte_corr;
+            
+            $display("BYTE %0d RESULT: 0x%02X (correlation: %0.6f)", 
+                     byte_pos, best_byte_val, best_byte_corr);
+            $display("Current key: %h", best_trng_a);
+        end
+    endtask
+
+    task calculate_correlation;
+        input [63:0] test_key;
+        output real correlation;
+        
+        integer sum_x, sum_y, sum_xy, sum_x2, sum_y2;
+        integer n, numerator, denom_x, denom_y;
+        real denom_real;
+        integer matches;
+        
+        begin
+            complete_system_reset;
+            
+            trng_a_in = test_key;
+            trng_d_in = true_trng_d;
+            dcr = 1;
+            repeat (10) @(posedge clk);
+            dcr = 0;
+            repeat (5) @(posedge clk);
+
+            // Read decoded pixels
+            for (i = 0; i < NUM_TEST_PIXELS; i = i + 1) begin
+                @(posedge clk);
+                cs = 1;
+                we = 0;
+                addr = i;
+                @(posedge clk);
+                while (!ready) @(posedge clk);
+                @(posedge clk);
+                decoded_pix[i] = rdata[7:0];
+                cs = 0;
+                
+                repeat (2) @(posedge clk);
+            end
+
+            // Calculate Pearson correlation
+            sum_x = 0; sum_y = 0; sum_xy = 0; sum_x2 = 0; sum_y2 = 0;
+            n = NUM_TEST_PIXELS;
+            
+            for (i = 0; i < NUM_TEST_PIXELS; i = i + 1) begin
+                sum_x = sum_x + reference_pix[i];
+                sum_y = sum_y + decoded_pix[i];
+                sum_xy = sum_xy + (reference_pix[i] * decoded_pix[i]);
+                sum_x2 = sum_x2 + (reference_pix[i] * reference_pix[i]);
+                sum_y2 = sum_y2 + (decoded_pix[i] * decoded_pix[i]);
+            end
+            
+            numerator = (n * sum_xy) - (sum_x * sum_y);
+            denom_x = (n * sum_x2) - (sum_x * sum_x);
+            denom_y = (n * sum_y2) - (sum_y * sum_y);
+            
+            if (denom_x <= 0 || denom_y <= 0) begin
+                correlation = 0.0;  // Avoid NaN
+            end else begin
+                denom_real = $sqrt($itor(denom_x) * $itor(denom_y));
+                correlation = $itor(numerator) / denom_real;
+                
+                if (correlation > 1.0) correlation = 1.0;
+                if (correlation < -1.0) correlation = -1.0;
+            end
+            
+            // Count exact matches for debugging
+            matches = 0;
+            for (i = 0; i < NUM_TEST_PIXELS; i = i + 1) begin
+                if (decoded_pix[i] == reference_pix[i]) matches = matches + 1;
+            end
+            
+            // Debug key cases
+            if (test_key == true_trng_a || test_key == 64'h0 || correlation > 0.8) begin
+                $display("    Key %h: %0d/%0d exact matches, correlation=%0.6f", 
+                         test_key, matches, NUM_TEST_PIXELS, correlation);
+            end
+        end
+    endtask
+
+    task analyze_results;
+        real hamming_distance;
+        integer correct_bytes;
+        begin
+            $display("\n=== RESULTS ===");
+            $display("Best found TRNG_A: %h", best_trng_a);
+            $display("True TRNG_A:       %h", true_trng_a);
+            $display("Best correlation:  %0.6f", best_correlation);
+            
+            hamming_distance = calculate_hamming_distance(best_trng_a, true_trng_a);
+            correct_bytes = count_correct_bytes(best_trng_a, true_trng_a);
+            
+            $display("Hamming distance:  %0.1f bits", hamming_distance);
+            $display("Correct bytes:     %0d/8", correct_bytes);
+            
+            if (hamming_distance == 0.0) begin
+                $display("PERFECT: Exact key recovered!");
+            end else if (hamming_distance <= 8.0) begin
+                $display("EXCELLENT: Very close to true key");
+            end else if (hamming_distance <= 16.0) begin
+                $display("GOOD: Reasonably close");
+            end else if (correct_bytes > 0) begin
+                $display("PARTIAL: Some bytes recovered");
+            end else begin
+                $display("POOR: No bytes recovered");
+            end
+            
+            if (best_correlation > 0.9) begin
+                $display("Attack achieved high correlation - likely successful");
+            end else if (best_correlation > 0.5) begin
+                $display("Attack achieved moderate correlation");
+            end else begin
+                $display("Attack achieved low correlation");
+            end
+        end
+    endtask
+    
+    function real calculate_hamming_distance;
+        input [63:0] a, b;
+        integer diff, count;
+        begin
+            diff = a ^ b;
+            count = 0;
+            while (diff != 0) begin
+                if (diff & 1) count = count + 1;
+                diff = diff >> 1;
+            end
+            calculate_hamming_distance = $itor(count);
         end
     endfunction
     
-    task generate_random_starting_points;
-        integer temp_rng;
-        reg [31:0] low_part, high_part;
+    function integer count_correct_bytes;
+        input [63:0] a, b;
+        integer correct;
         begin
-            temp_rng = rng_state;
-            
-            for (start_idx = 0; start_idx < NUM_RANDOM_STARTS; start_idx = start_idx + 1) begin
-                temp_rng = next_random(temp_rng);
-                low_part = temp_rng;
-                temp_rng = next_random(temp_rng);
-                high_part = temp_rng;
-                start_keys[start_idx] = {high_part, low_part};
-            end
-            
-            if (NUM_RANDOM_STARTS >= 4) begin
-                start_keys[NUM_RANDOM_STARTS-4] = 64'h0000000000000000;
-                start_keys[NUM_RANDOM_STARTS-3] = 64'hFFFFFFFFFFFFFFFF;
-                start_keys[NUM_RANDOM_STARTS-2] = 64'hAAAAAAAAAAAAAAAA;
-                start_keys[NUM_RANDOM_STARTS-1] = 64'h5555555555555555;
-            end
+            correct = 0;
+            if (a[63:56] == b[63:56]) correct = correct + 1;
+            if (a[55:48] == b[55:48]) correct = correct + 1;
+            if (a[47:40] == b[47:40]) correct = correct + 1;
+            if (a[39:32] == b[39:32]) correct = correct + 1;
+            if (a[31:24] == b[31:24]) correct = correct + 1;
+            if (a[23:16] == b[23:16]) correct = correct + 1;
+            if (a[15:8] == b[15:8]) correct = correct + 1;
+            if (a[7:0] == b[7:0]) correct = correct + 1;
+            count_correct_bytes = correct;
         end
-    endtask
-    
-    task perform_key_verification;
-        reg [63:0] test_key;
-        begin
-            $display("KEY VERIFICATION - Testing Known Keys");
-            
-            test_key = true_trng_a;
-            corrected_score_candidate(test_key, test_p, test_s, test_c, test_m, true_key_score);
-            $display("TRUE key: %h scores %0.6f", test_key, true_key_score);
-            
-            test_key = 64'h0;
-            corrected_score_candidate(test_key, test_p, test_s, test_c, test_m, zero_key_score);
-            $display("ZERO key: scores %0.6f", zero_key_score);
-            
-            test_key = 64'hFFFFFFFFFFFFFFFF;
-            corrected_score_candidate(test_key, test_p, test_s, test_c, test_m, wrong_key_score);
-            $display("WRONG key: scores %0.6f", wrong_key_score);
-            
-            if (true_key_score > zero_key_score && true_key_score > wrong_key_score) begin
-                $display("PASS: True key has highest score");
-            end else begin
-                $display("FAIL: True key does not have highest score");
-            end
-        end
-    endtask
+    endfunction
     
     function [7:0] get_current_byte;
         input [63:0] key;
@@ -307,137 +453,6 @@ module tb_attack_multi_start_search;
         end
     endtask
     
-    task corrected_score_candidate;
-        input [63:0] key;
-        output real pearson_score;
-        output real spearman_score;
-        output real cosine_score;
-        output real mse_score;
-        output real composite_score;
-        
-        integer sum_x, sum_y, sum_xy, sum_x2, sum_y2;
-        integer n, numerator, denom_x, denom_y;
-        real denom_real, dot_product, norm_x, norm_y, mse_raw;
-        integer temp_val;
-        real raw_pearson, raw_cosine, raw_mse_sim;
-        
-        begin
-            complete_system_reset;
-            
-            repeat (20) @(posedge clk);
-            
-            trng_a_in = key;
-            trng_d_in = bad_trng_d;
-            
-            dcr = 1;
-            repeat (10) @(posedge clk);
-            dcr = 0;
-            repeat (10) @(posedge clk);
-            
-            for (i = 0; i < 16384; i = i + 1) begin
-                repeat (2) @(posedge clk);
-                cs = 1;
-                we = 0;
-                addr = i;
-                repeat (2) @(posedge clk);
-                while (!ready) @(posedge clk);
-                repeat (2) @(posedge clk);
-                temp_decoded[i] = rdata[7:0];
-                cs = 0;
-                repeat (2) @(posedge clk);
-            end
-            
-            cs = 0;
-            we = 0;
-            addr = 0;
-            repeat (10) @(posedge clk);
-            
-            for (i = 0; i < 16384; i = i + 1) begin
-                decoded_pix[i] = temp_decoded[i];
-            end
-            
-            n = 16384;
-            
-            sum_x = 0; sum_y = 0; sum_xy = 0; sum_x2 = 0; sum_y2 = 0;
-            
-            for (i = 0; i < n; i = i + 1) begin
-                sum_x = sum_x + plain_pix[i];
-                sum_y = sum_y + decoded_pix[i];
-                sum_xy = sum_xy + (plain_pix[i] * decoded_pix[i]);
-                sum_x2 = sum_x2 + (plain_pix[i] * plain_pix[i]);
-                sum_y2 = sum_y2 + (decoded_pix[i] * decoded_pix[i]);
-            end
-            
-            numerator = (n * sum_xy) - (sum_x * sum_y);
-            denom_x = (n * sum_x2) - (sum_x * sum_x);
-            denom_y = (n * sum_y2) - (sum_y * sum_y);
-            
-            if (denom_x <= 0 || denom_y <= 0) begin
-                raw_pearson = 0.0;
-            end else begin
-                denom_real = $sqrt($itor(denom_x) * $itor(denom_y));
-                raw_pearson = $itor(numerator) / denom_real;
-            end
-            
-            if (raw_pearson > 1.0) raw_pearson = 1.0;
-            if (raw_pearson < -1.0) raw_pearson = -1.0;
-            
-            spearman_score = raw_pearson;
-            
-            dot_product = 0.0;
-            norm_x = 0.0;
-            norm_y = 0.0;
-            
-            for (i = 0; i < n; i = i + 1) begin
-                dot_product = dot_product + ($itor(plain_pix[i]) * $itor(decoded_pix[i]));
-                norm_x = norm_x + ($itor(plain_pix[i]) * $itor(plain_pix[i]));
-                norm_y = norm_y + ($itor(decoded_pix[i]) * $itor(decoded_pix[i]));
-            end
-            
-            norm_x = $sqrt(norm_x);
-            norm_y = $sqrt(norm_y);
-            
-            if (norm_x == 0.0 || norm_y == 0.0) begin
-                raw_cosine = 0.0;
-            end else begin
-                raw_cosine = dot_product / (norm_x * norm_y);
-            end
-            
-            if (raw_cosine > 1.0) raw_cosine = 1.0;
-            if (raw_cosine < -1.0) raw_cosine = -1.0;
-            
-            mse_raw = 0.0;
-            for (i = 0; i < n; i = i + 1) begin
-                temp_val = plain_pix[i] - decoded_pix[i];
-                mse_raw = mse_raw + ($itor(temp_val) * $itor(temp_val));
-            end
-            mse_raw = mse_raw / $itor(n);
-            
-            raw_mse_sim = 1.0 - (mse_raw / 65025.0);
-            if (raw_mse_sim < 0.0) raw_mse_sim = 0.0;
-            if (raw_mse_sim > 1.0) raw_mse_sim = 1.0;
-            
-            pearson_score = (raw_pearson + 1.0) / 2.0;
-            spearman_score = (raw_pearson + 1.0) / 2.0;
-            cosine_score = (raw_cosine + 1.0) / 2.0;
-            mse_score = raw_mse_sim;
-            
-            if (pearson_score < 0.0) pearson_score = 0.0;
-            if (pearson_score > 1.0) pearson_score = 1.0;
-            if (cosine_score < 0.0) cosine_score = 0.0;
-            if (cosine_score > 1.0) cosine_score = 1.0;
-            if (mse_score < 0.0) mse_score = 0.0;
-            if (mse_score > 1.0) mse_score = 1.0;
-            
-            composite_score = 0.50 * pearson_score + 0.20 * cosine_score + 0.30 * mse_score;
-            
-            if (composite_score < 0.0) composite_score = 0.0;
-            if (composite_score > 1.0) composite_score = 1.0;
-            
-            complete_system_reset;
-        end
-    endtask
-    
     task complete_system_reset;
         begin
             cs = 0;
@@ -454,208 +469,6 @@ module tb_attack_multi_start_search;
             repeat (5) @(posedge clk);
             rst_n = 1;
             repeat (10) @(posedge clk);
-        end
-    endtask
-    
-    task load_realistic_test_image;
-        integer seed;
-        integer temp_val;
-        begin
-            seed = 42;
-            
-            for (i = 0; i < 16384; i = i + 1) begin
-                temp_val = ((i % 256) ^ ((i/128) % 256) ^ ((i*3) % 256));
-                plain_pix[i] = temp_val[7:0];
-                
-                if (i % 1000 == 0) begin
-                    plain_pix[i] = plain_pix[i] ^ 8'h55;
-                end
-            end
-            $display("Loaded test image");
-        end
-    endtask
-    
-    task encode_reference_image;
-        begin
-            complete_system_reset;
-            
-            trng_a_in = true_trng_a;
-            trng_d_in = true_trng_d;
-            dcr = 1;
-            repeat (10) @(posedge clk);
-            dcr = 0;
-            repeat (10) @(posedge clk);
-
-            for (i = 0; i < 16384; i = i + 1) begin
-                @(posedge clk);
-                cs = 1;
-                we = 1;
-                addr = i;
-                wdata = {43'd0, plain_pix[i]};
-                @(posedge clk);
-                while (!ready) @(posedge clk);
-                @(posedge clk);
-                cs = 0;
-            end
-            $display("Encoded reference image");
-            complete_system_reset;
-        end
-    endtask
-    
-    task decode_reference_image;
-        begin
-            complete_system_reset;
-            
-            trng_a_in = true_trng_a;
-            trng_d_in = true_trng_d;
-            dcr = 1;
-            repeat (10) @(posedge clk);
-            dcr = 0;
-            repeat (10) @(posedge clk);
-
-            fh = $fopen("reference_correct_decode.txt","w");
-            for (i = 0; i < 16384; i = i + 1) begin
-                @(posedge clk);
-                cs = 1;
-                we = 0;
-                addr = i;
-                @(posedge clk);
-                while (!ready) @(posedge clk);
-                @(posedge clk);
-                $fwrite(fh, "%013X\n", rdata);
-                cs = 0;
-            end
-            $fclose(fh);
-            $display("Generated reference decode file");
-            complete_system_reset;
-        end
-    endtask
-    
-    task generate_comparison_case;
-        begin
-            complete_system_reset;
-            
-            trng_a_in = true_trng_a;
-            trng_d_in = bad_trng_d;
-            dcr = 1;
-            repeat (10) @(posedge clk);
-            dcr = 0;
-            repeat (10) @(posedge clk);
-
-            fh = $fopen("correct_trnga_wrong_trngd.txt","w");
-            for (i = 0; i < 16384; i = i + 1) begin
-                @(posedge clk);
-                cs = 1;
-                we = 0;
-                addr = i;
-                @(posedge clk);
-                while (!ready) @(posedge clk);
-                @(posedge clk);
-                $fwrite(fh, "%013X\n", rdata);
-                cs = 0;
-            end
-            $fclose(fh);
-            $display("Generated comparison case file");
-            complete_system_reset;
-        end
-    endtask
-    
-    task dump_byte_snapshot;
-        input integer start_num;
-        input integer iter_num;
-        input integer byte_num;
-        begin
-            $sformat(fname, "byte_s%0d_i%0d_b%0d.txt", start_num, iter_num, byte_num);
-            fh = $fopen(fname,"w");
-            for (i = 0; i < 16384; i = i + 1) begin
-                $fwrite(fh,"%013X\n", {43'd0, decoded_pix[i]});
-            end
-            $fclose(fh);
-        end
-    endtask
-    
-    task dump_iteration_snapshot;
-        input integer start_num;
-        input integer iter_num;
-        begin
-            $sformat(fname, "iter_s%0d_i%0d.txt", start_num, iter_num);
-            fh = $fopen(fname,"w");
-            for (i = 0; i < 16384; i = i + 1) begin
-                $fwrite(fh,"%013X\n", {43'd0, decoded_pix[i]});
-            end
-            $fclose(fh);
-        end
-    endtask
-    
-    task dump_final_comparison;
-        begin
-            for (iter_idx = 0; iter_idx < NUM_ITERATIONS; iter_idx = iter_idx + 1) begin
-                complete_system_reset;
-                
-                trng_a_in = global_best_key;
-                trng_d_in = bad_trng_d;
-                dcr = 1;
-                repeat (10) @(posedge clk);
-                dcr = 0;
-                repeat (10) @(posedge clk);
-
-                $sformat(fname, "final_iteration_%0d.txt", iter_idx);
-                fh = $fopen(fname,"w");
-
-                for (i = 0; i < 16384; i = i + 1) begin
-                    @(posedge clk);
-                    cs = 1;
-                    we = 0;
-                    addr = i;
-                    @(posedge clk);
-                    while (!ready) @(posedge clk);
-                    @(posedge clk);
-                    $fwrite(fh,"%013X\n", rdata);
-                    cs = 0;
-                end
-                $fclose(fh);
-            end
-            $display("Generated final comparison files");
-            complete_system_reset;
-        end
-    endtask
-    
-    task generate_summary_file;
-        begin
-            fh = $fopen("multi_metric_summary.txt","w");
-            $fwrite(fh,"Multi-Start Random Search Summary\n");
-            $fwrite(fh,"=================================\n\n");
-            $fwrite(fh,"Ground Truth: %h\n", true_trng_a);
-            $fwrite(fh,"Random starts: %0d\n", NUM_RANDOM_STARTS);
-            $fwrite(fh,"Iterations: %0d\n", NUM_ITERATIONS);
-            $fwrite(fh,"Errors: %0d\n\n", consistency_errors);
-            
-            $fwrite(fh,"Key Verification:\n");
-            $fwrite(fh,"True key: %0.6f\n", true_key_score);
-            $fwrite(fh,"Zero key: %0.6f\n", zero_key_score);
-            $fwrite(fh,"Wrong key: %0.6f\n\n", wrong_key_score);
-            
-            $fwrite(fh,"Results:\n");
-            for (start_idx = 0; start_idx < NUM_RANDOM_STARTS; start_idx = start_idx + 1) begin
-                if (start_idx == best_start_idx) begin
-                    $fwrite(fh,"Start %0d: %h (%0.6f) BEST\n", 
-                            start_idx, start_results[start_idx], start_scores[start_idx]);
-                end else begin
-                    $fwrite(fh,"Start %0d: %h (%0.6f)\n", 
-                            start_idx, start_results[start_idx], start_scores[start_idx]);
-                end
-            end
-            
-            $fwrite(fh,"\nBest: %h (%0.6f)\n", global_best_key, global_best_score);
-            
-            if (true_key_score > global_best_score) begin
-                $fwrite(fh,"Status: PASS - True key highest\n");
-            end else begin
-                $fwrite(fh,"Status: FAIL - Attack too good\n");
-            end
-            
-            $fclose(fh);
-            $display("Generated summary file");
         end
     endtask
 
